@@ -317,68 +317,93 @@ def sample(dataDir, model_path, prefix='.'):
     predict_func = OfflinePredictor(PredictConfig(
         model=Model(),
         session_init=get_model_loader(model_path),
-        input_names=['image', 'affnt'],
+        input_names=['image'],
         output_names=['pia']))
 
-    for k in range(len(imageFiles)):
-        image = skimage.io.imread(imageFiles[k])
+    for imageFile in imageFiles:
+        head, tail = os.path.split(imageFile)
+        print tail
+        affntFile = prefix+tail
+        print affntFile
+
+        # Read the image file
+        image = skimage.io.imread(imageFile)
+
+        #image = np.expand_dims(image, axis=-1)
+        # convert to 3 channel image
+        image = np.stack((image, image, image), -1)
         print(image.shape)
-        image = np.expand_dims(image, axis=3)
-        image_0 = image.copy()
-        image_1 = image.copy()
-        image_2 = image.copy()
-        image   = np.concatenate((image_0, image_1, image_2), axis=3) 
-        print(image.shape)
+        def weighted_map_blocks(arr, inner, ghost, func=None): # work for 3D, inner=[1, 3, 3], ghost=[0, 2, 2], 
+            dtype = np.float32 #arr.dtype
 
-        affnt = np.zeros_like(image)
-
-        skimage.io.imsave("tmp_image.tif", np.squeeze(image).astype(np.uint8))
-        skimage.io.imsave("tmp_affnt.tif", np.squeeze(image).astype(np.uint8))
-
-        # group the input to form one datapoint
-        instance = []
-        instance.append(image)
-        instance.append(affnt)
-        # instance = np.array(instance).astype(np.float32)
-        instance = np.array(instance).astype(np.float32)
-        import dask.array as da 
-
-        #print(instance)
-        da_instance = da.from_array(instance, chunks=(2, 8, 512, 512, 3))  #*** Modify here
-        #print(da_instance)
-        gp_instance = da.ghost.ghost(da_instance, depth={0:0, 1:1, 2:64, 3:64, 4:0}, 
-                                                  boundary={0:0, 1:'reflect', 2:'reflect', 3:'reflect', 4:0})
-        
-        def func(block, predict_func):
-            #print(block.shape)
-            bl_image = block[0,...,0:1]            
-            bl_affnt = block[1,...,0:3]
-            pred = predict_func(bl_image, 
-                                bl_affnt
-                                )
-
-            # d = pred[0] # First output
-            d = np.array(pred)
-            # print(d.shape)
-
-            # skimage.io.imsave("bl_image.tif", np.squeeze(bl_image).astype(np.uint8))
-            # skimage.io.imsave("bl_affnt.tif", np.squeeze(bl_affnt).astype(np.uint8))
-            #skimage.io.imsave("tmp_affnt.tif", 255*d.astype(np.uint8))
-            # Crop to the clean version
-            #d = d[640:1280, 640:1280]
-            # print(d.shape)
-            # d = np.expand_dims(d, axis=0) # concatenation
-            return d
+            arr = arr.astype(np.float32)
+            # param
+            outer = inner + 2*ghost
+            outer = [(i + 2*g) for i, g in zip(inner, ghost)]
+            shape = outer
+            steps = inner
+                
+            print(outer)
+            print(shape)
+            print(inner)
             
-        gp_deployment = gp_instance.map_blocks(func, predict_func, dtype=np.float32)
-        gp_deployment = da.ghost.trim_internal(gp_deployment, {0:0, 1:1, 2:64, 3:64, 4:0})
+            # pad the array
+            padding = np.pad(arr, [[ghost[0], ghost[0]], 
+                                   [ghost[1], ghost[1]], 
+                                   [ghost[2], ghost[2]],  
+                                   [ghost[3], ghost[3]]] , mode='symmetric') # mode='symmetric') #
+            print(padding.shape)
+            #print(padding)
+            
+            weights = np.zeros_like(padding)
+            results = np.zeros_like(padding)
+            
+            v_padding = sliding_window_view(padding, shape, steps)
+            v_weights = sliding_window_view(weights, shape, steps)
+            v_results = sliding_window_view(results, shape, steps)
+            
+            def invert(val):
+                #return 255-val 
+                return val
 
-        gp_deployment = np.squeeze(np.array(255*gp_deployment)).astype(np.uint8) #.astype(np.uint8) # Modify here
-        np_deployment = 255*gp_deployment #.astype(np.uint8) # Modify here
-        print(np_deployment.shape)
-        skimage.io.imsave(prefix+"_{}.tif".format(k+1), np_deployment)
+            for z in range(v_padding.shape[0]):
+                for y in range(v_padding.shape[1]):
+                    for x in range(v_padding.shape[2]):
+                        #for c in range(v_padding.shape[3]):
+                        # Get the result
+                        #v_result = invert(v_padding[z,y,x]) ### Todo function is here
+                        v_result = np.array(func(
+                                                (v_padding[z,y,x,0][...,0:1]) ) ) ### Todo function is here
+                        v_results[z,y,x] += np.squeeze(v_result, axis=0)
+                            
+                        v_weight = np.ones_like(v_result)
+                        v_weights[z,y,x] += v_weight
+                            
+            # Divided by the weight param
+            results /= weights 
+            
+            
+            current_shape = results.shape
+            trimmed_shape = [np.arange(ghost[0]),(results.shape[0] - ghost[0]), 
+                             np.arange(ghost[1]),(results.shape[1] - ghost[1]), 
+                             np.arange(ghost[2]),(results.shape[2] - ghost[2]), 
+                             np.arange(ghost[3]),(results.shape[3] - ghost[3]), 
+                             ]
+            # Trim the result
+            results = results[(ghost[0]):(results.shape[0] - ghost[0]), 
+                              (ghost[1]):(results.shape[1] - ghost[1]), 
+                              (ghost[2]):(results.shape[2] - ghost[2]),
+                              (ghost[3]):(results.shape[3] - ghost[3]),
+                              ...]
+            #results = results[trimmed_shape]
+            
+            return results.astype(dtype)
+    
 
-        print("Ending...")
+        #affnt = weighted_map_blocks(image, [20, 128, 128, 3], [2, 72, 72, 0], predict_func)
+        affnt = weighted_map_blocks(image, [20, 256, 256, 3], [2, 8, 8, 0], predict_func)
+        affnt = np.squeeze(affnt)
+        skimage.io.imsave(affntFile, affnt)
     return None
 ###############################################################################
 if __name__ == '__main__':
